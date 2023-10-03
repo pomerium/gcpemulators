@@ -3,6 +3,7 @@ package gcsemu
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -201,7 +202,7 @@ func (fs *filestore) ReadMeta(baseUrl HttpBaseUrl, bucket string, filename strin
 	f := fs.filename(bucket, filename)
 	obj := &storage.Object{}
 	fMeta := metaFilename(f)
-	buf, err := ioutil.ReadFile(fMeta)
+	buf, err := os.ReadFile(fMeta)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("could not read metadata file %s: %w", fMeta, err)
@@ -217,7 +218,14 @@ func (fs *filestore) ReadMeta(baseUrl HttpBaseUrl, bucket string, filename strin
 	InitMetaWithUrls(baseUrl, obj, bucket, filename, uint64(fInfo.Size()))
 	obj.Generation = fInfo.ModTime().UnixNano() // use the mod time as the generation number
 	obj.Updated = fInfo.ModTime().UTC().Format(time.RFC3339Nano)
+	obj.Etag = getETag([]byte(obj.Updated))
 	return obj, nil
+}
+
+func getETag(contents []byte) string {
+	h := sha256.New()
+	h.Write(contents)
+	return fmt.Sprintf("\"%x\"", h.Sum(nil))
 }
 
 func (fs *filestore) filename(bucket string, filename string) string {

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	cloudstorage "cloud.google.com/go/storage"
 	"github.com/bluele/gcache"
@@ -133,7 +134,7 @@ func (g *GcsEmu) Handler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			alt := r.URL.Query().Get("alt")
 			if alt == "media" || (p.IsPublic && alt == "") {
-				g.handleGcsMediaRequest(baseUrl, w, r.Header.Get("Accept-Encoding"), bucket, object)
+				g.handleGcsMediaRequest(baseUrl, w, r.Header, bucket, object)
 			} else if alt == "json" || (!p.IsPublic && alt == "") {
 				g.handleGcsMetadataRequest(baseUrl, w, bucket, object)
 			} else {
@@ -270,7 +271,7 @@ func (g *GcsEmu) handleGcsDelete(ctx context.Context, w http.ResponseWriter, buc
 	w.WriteHeader(http.StatusOK)
 }
 
-func (g *GcsEmu) handleGcsMediaRequest(baseUrl HttpBaseUrl, w http.ResponseWriter, acceptEncoding, bucket, filename string) {
+func (g *GcsEmu) handleGcsMediaRequest(baseUrl HttpBaseUrl, w http.ResponseWriter, header http.Header, bucket, filename string) {
 	obj, contents, err := g.store.Get(baseUrl, bucket, filename)
 	if err != nil {
 		g.gapiError(w, http.StatusInternalServerError, fmt.Sprintf("failed to check existence of %s/%s: %s", bucket, filename, err))
@@ -281,6 +282,16 @@ func (g *GcsEmu) handleGcsMediaRequest(baseUrl HttpBaseUrl, w http.ResponseWrite
 		return
 	}
 
+	if obj.Etag != "" {
+		w.Header().Set("ETag", obj.Etag)
+	}
+
+	var lastMod time.Time
+	lastMod, err = time.Parse(time.RFC3339Nano, obj.Updated)
+	if err == nil {
+		w.Header().Set("Last-Modified", lastMod.Format(http.TimeFormat))
+	}
+
 	w.Header().Set("Content-Type", obj.ContentType)
 	w.Header().Set("X-Goog-Generation", strconv.FormatInt(obj.Generation, 10))
 	w.Header().Set("X-Goog-Metageneration", strconv.FormatInt(obj.Metageneration, 10))
@@ -288,8 +299,13 @@ func (g *GcsEmu) handleGcsMediaRequest(baseUrl HttpBaseUrl, w http.ResponseWrite
 	w.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length, Content-Encoding, Date, X-Goog-Generation, X-Goog-Metageneration")
 	w.Header().Set("Content-Disposition", obj.ContentDisposition)
 
+	if isNotModified(header, obj) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
 	if obj.ContentEncoding == "gzip" {
-		if strings.Contains(acceptEncoding, "gzip") {
+		if strings.Contains(header.Get("accept-encoding"), "gzip") {
 			w.Header().Set("Content-Encoding", "gzip")
 		} else {
 			// Uncompress on behalf of the client.
@@ -308,11 +324,34 @@ func (g *GcsEmu) handleGcsMediaRequest(baseUrl HttpBaseUrl, w http.ResponseWrite
 		}
 	}
 
+	// set metadata headers; for consistency with GCS, only returned for non-conditional requests
+	for k, v := range obj.Metadata {
+		w.Header().Set("X-Goog-Meta-"+k, v)
+	}
+
 	// Just write the contents
 	w.Header().Set("Content-Length", strconv.Itoa(len(contents)))
 	if _, err := w.Write(contents); err != nil {
 		g.gapiError(w, http.StatusInternalServerError, fmt.Sprintf("failed to copy from %s/%s: %s", bucket, filename, err))
 	}
+}
+
+func isNotModified(header http.Header, obj *storage.Object) bool {
+	if obj.Etag != "" && header.Get("If-None-Match") == obj.Etag {
+		return true
+	}
+
+	updated, err := time.Parse(time.RFC3339Nano, obj.Updated)
+	if err != nil {
+		return false
+	}
+
+	modifiedSince, err := http.ParseTime(header.Get("If-Modified-Since"))
+	if err != nil {
+		return false
+	}
+
+	return modifiedSince.After(updated)
 }
 
 func (g *GcsEmu) handleGcsMetadataRequest(baseUrl HttpBaseUrl, w http.ResponseWriter, bucket string, filename string) {
